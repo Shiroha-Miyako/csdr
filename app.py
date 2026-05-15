@@ -7,6 +7,8 @@ import streamlit as st
 
 from csrc_agent import (
     WorkbookReadError,
+    extract_supplement_dates_from_filename,
+    format_date_slash,
     is_valid_xlsx,
     parse_supplement_doc,
     sync_filing_xlsx,
@@ -33,12 +35,12 @@ st.sidebar.header("输入文件")
 master = st.sidebar.file_uploader("1）你的总表 xlsx", type=["xlsx"])
 supp_doc = st.sidebar.file_uploader("2）补充材料要求 docx（可选）", type=["docx"])
 filing_xlsx = st.sidebar.file_uploader("3）官网备案情况表 xlsx（可选）", type=["xlsx"])
-supp_date = st.sidebar.text_input("补充材料公告日期", value="2026-05-08")
+st.sidebar.caption("补充材料公告当周 / 公告日期会优先从 Word 文件名自动提取。")
 
 st.sidebar.markdown("---")
 nst_completed = st.sidebar.text_area(
     "已完成备案公司（可选，每行：公司名,日期）",
-    value="广州豪特节能环保科技股份有限公司,2026-05-09\n华健未来（成都）科技股份有限公司,2026-05-09\n南京海纳医药科技股份有限公司,2026-05-09",
+    value="广州豪特节能环保科技股份有限公司,2026/5/9\n华健未来（成都）科技股份有限公司,2026/5/9\n南京海纳医药科技股份有限公司,2026/5/9",
     height=120,
 )
 
@@ -66,7 +68,7 @@ def parse_completed_items(raw_text: str):
         if not line or "," not in line:
             continue
         company, date = line.split(",", 1)
-        company, date = company.strip(), date.strip()
+        company, date = company.strip(), format_date_slash(date.strip())
         if company and date:
             items.append((company, date))
     return items
@@ -110,6 +112,12 @@ if run:
             # Step 3: 补充材料 docx 解析和写回
             issues_df = None
             if supp_doc:
+                supp_week_start, supp_notice_date = extract_supplement_dates_from_filename(supp_doc.name)
+                if supp_week_start and supp_notice_date:
+                    st.info(f"从 Word 文件名识别到：备案补充材料公告当周 = {supp_week_start}，备案补充材料公告日期 = {supp_notice_date}")
+                else:
+                    st.warning("未能从 Word 文件名识别日期。请确认文件名类似：境外发行上市备案补充材料要求公示（2026年4月27日—2026年5月8日）.docx")
+
                 sp = td / "supplement.docx"
                 save_upload(supp_doc, sp)
 
@@ -120,7 +128,13 @@ if run:
                     st.dataframe(issues_df, use_container_width=True)
 
                 final_path = td / "output_csrc_agent.xlsx"
-                update_master_with_issues(str(current_path), issues, supp_date, str(final_path))
+                update_master_with_issues(
+                    str(current_path),
+                    issues,
+                    supp_notice_date,
+                    str(final_path),
+                    supp_week_start=supp_week_start,
+                )
                 current_path = final_path
 
             st.markdown("### 下载结果")
