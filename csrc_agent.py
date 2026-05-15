@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import re
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,13 @@ from typing import Dict, List, Optional, Tuple
 
 from docx import Document
 from openpyxl import load_workbook
+# 某些证监会表格或手工模板里带有 Excel 图表/绘图 XML，openpyxl 读取时可能报 pitchFamily 错误。
+# 这个工具只处理单元格数据，不需要读取图片/图表，因此禁用图片/图表解析。
+try:
+    import openpyxl.reader.excel as _openpyxl_excel
+    _openpyxl_excel.find_images = lambda archive, path: ([], [])
+except Exception:
+    pass
 from rapidfuzz import fuzz, process
 
 try:
@@ -21,11 +29,14 @@ CHINESE_NUM = "一二三四五六七八九十"
 
 # 你可以持续维护这个词典：优先级高于 AI
 KEYWORD_RULES = [
+    (["股权架构", "返程并购", "37 号文", "37号文"], "股权架构搭建及返程并购的合规性", "业务合规"),
+    (["业务经营", "数字广告", "网络推广", "职业中介", "广播电视节目制作"], "业务经营合规性", "业务合规"),
+    (["境内运营实体", "重大诉讼", "行政处罚", "历次股权变动"], "境内运营实体情况", "业务合规"),
     (["高耗能", "高排放", "排污", "固定污染物"], "已建、在建及此次募投项目是否属于“高耗能”“高排放”项目", "环保"),
     (["全流通", "质押", "冻结", "权利瑕疵"], "全流通股份的瑕疵情形", "全流通"),
     (["国有股东", "国有股标识", "国资"], "国有股东标识办理进展情况", "国有股份"),
-    (["最近12个月", "新增股东", "入股价格", "利益输送"], "新增股东入股价格的定价依据及合理性", "股东情况"),
     (["股权激励", "员工持股", "外部顾问", "期权激励"], "股权激励计划", "股权激励"),
+    (["最近12个月", "新增股东", "入股价格", "利益输送"], "新增股东入股价格的定价依据及合理性", "股东情况"),
     (["股份代持", "股权代持", "代持"], "股份代持情况", "股份代持"),
     (["历次增资", "股权转让", "实缴出资", "抽逃出资", "出资方式"], "历次股权变动的合法合规性", "股权变更"),
     (["持股5%以上", "5%以上", "穿透", "禁止持股"], "持股5%以上股东信息", "股东情况"),
@@ -42,6 +53,59 @@ KEYWORD_RULES = [
     (["安全生产", "行政处罚"], "安全生产法律法规落实情况", "生产安全"),
     (["第八条", "不得境外发行上市", "禁止境外发行上市"], "专项核查（是否存在不得境外发行上市的情形）", "法律合规"),
 ]
+
+
+
+class WorkbookReadError(ValueError):
+    """用户上传的 Excel 文件无法被 openpyxl 读取时使用的友好错误。"""
+
+
+def is_valid_xlsx(path: str) -> bool:
+    """xlsx 本质是 zip 包。先用 zipfile 做快速校验，避免云端报红色 ValueError。"""
+    try:
+        return zipfile.is_zipfile(path)
+    except Exception:
+        return False
+
+
+def safe_load_workbook(path: str, **kwargs):
+    """
+    更稳地读取 Excel 工作簿。
+    常见失败原因：文件不是标准 .xlsx、下载成 HTML、.xls 改后缀、文件损坏、外部链接/绘图 XML 兼容问题。
+    """
+    path = str(path)
+    if not is_valid_xlsx(path):
+        raise WorkbookReadError(
+            "上传的文件不是有效的 .xlsx 工作簿。请用 Excel 或 WPS 打开该文件，"
+            "选择“另存为”→“Excel 工作簿 (*.xlsx)”，再重新上传。"
+        )
+
+    options = {
+        "data_only": False,
+        "read_only": False,
+        "keep_vba": False,
+        "keep_links": False,
+    }
+    options.update(kwargs)
+
+    try:
+        return load_workbook(path, **options)
+    except TypeError:
+        # 兼容不同 openpyxl 版本的参数差异
+        options.pop("rich_text", None)
+        try:
+            return load_workbook(path, **options)
+        except Exception as e:
+            raise WorkbookReadError(
+                "openpyxl 无法读取该 Excel 文件。请先用 Excel/WPS 打开并另存为新的 .xlsx 文件，"
+                "文件名尽量使用英文，例如 master.xlsx、filing_table.xlsx。"
+            ) from e
+    except Exception as e:
+        raise WorkbookReadError(
+            "openpyxl 无法读取该 Excel 文件。请先用 Excel/WPS 打开并另存为新的 .xlsx 文件，"
+            "文件名尽量使用英文，例如 master.xlsx、filing_table.xlsx。"
+        ) from e
+
 
 @dataclass
 class Issue:
@@ -157,7 +221,8 @@ def load_history_examples(wb) -> List[Tuple[str, str, str]]:
 def classify_by_rules(issue_text: str, examples: List[Tuple[str, str, str]]) -> Tuple[str, str, str]:
     # 1) 关键词规则
     for kws, summary, category in KEYWORD_RULES:
-        if any(k in issue_text for k in kws):
+        issue_no_space = re.sub(r"\s+", "", issue_text)
+        if any(k in issue_text or re.sub(r"\s+", "", k) in issue_no_space for k in kws):
             return summary, category, "keyword"
     # 2) 历史相似问题匹配
     if examples:
@@ -173,7 +238,7 @@ def classify_by_rules(issue_text: str, examples: List[Tuple[str, str, str]]) -> 
 def parse_supplement_doc(docx_path: str, master_wb_path: str) -> List[Issue]:
     text = read_docx_text(docx_path)
     sections = split_company_sections(text)
-    wb = load_workbook(master_wb_path)
+    wb = safe_load_workbook(master_wb_path)
     examples = load_history_examples(wb)
 
     issues: List[Issue] = []
@@ -208,7 +273,7 @@ def find_company_row(ws, company: str, name_col: int = 2) -> Optional[int]:
 
 
 def update_master_with_issues(master_path: str, issues: List[Issue], supp_date: str, out_path: str):
-    wb = load_workbook(master_path)
+    wb = safe_load_workbook(master_path)
     ws = wb["备案情况总表"] if "备案情况总表" in wb.sheetnames else wb.active
     history_ws = wb["问题类型统计"] if "问题类型统计" in wb.sheetnames else None
     add_ws = wb["本次新增"] if "本次新增" in wb.sheetnames else wb.create_sheet("本次新增")
@@ -251,7 +316,7 @@ def update_master_with_issues(master_path: str, issues: List[Issue], supp_date: 
 
 def update_completed_filings(master_path: str, completed_items: List[Tuple[str, str]], out_path: str):
     """completed_items: [(公司名, 完成备案日期)]"""
-    wb = load_workbook(master_path)
+    wb = safe_load_workbook(master_path)
     ws = wb["备案情况总表"] if "备案情况总表" in wb.sheetnames else wb.active
     for company, completed_date in completed_items:
         r = find_company_row(ws, company, name_col=2)
@@ -266,9 +331,9 @@ def update_completed_filings(master_path: str, completed_items: List[Tuple[str, 
 
 def sync_filing_xlsx(master_path: str, new_filing_xlsx: str, out_path: str):
     """把官网最新备案情况表中的新增企业或更新信息同步到主表。"""
-    master_wb = load_workbook(master_path)
+    master_wb = safe_load_workbook(master_path)
     master_ws = master_wb["备案情况总表"] if "备案情况总表" in master_wb.sheetnames else master_wb.active
-    new_wb = load_workbook(new_filing_xlsx, data_only=False)
+    new_wb = safe_load_workbook(new_filing_xlsx, data_only=False)
     new_ws = new_wb.active
 
     # 新表列 A-J，对应主表 A-I 基本信息。主表 C-I 与新表 C-I 基本一致。

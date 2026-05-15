@@ -1,40 +1,68 @@
-# CSRC 境外上市备案表自动处理 Agent - Starter
+# CSRC Filing Agent
 
-## 你要做的三件事
-1. 备案通知书公告：把总表里对应公司的“备案状态/补充材料”改成“已完成备案”，并填写完成备案时间。
-2. 补充材料要求公告：解析 docx，把每家公司的一、二、三大问题写回总表 Sheet1 的问题1-问题9；同时追加到问题库 Sheet2/Sheet3，用历史问题库做标准化概括和大类分类。
-3. 备案情况表公告：读取官网新 xlsx，与旧总表按企业名称匹配，把新增企业或更新信息同步进总表。
+一个用于处理证监会境外发行上市备案材料的 Streamlit 工具。
 
-## 安装
+## 功能
+
+- 上传主表 Excel
+- 上传补充材料要求 DOCX
+- 上传官网备案情况表 XLSX
+- 自动同步新增/更新企业信息
+- 自动更新“已完成备案”状态和备案完成时间
+- 自动按公司拆分补充材料问题
+- 按“一、二、三……”大问题切分，不拆（1）（2）（3）
+- 根据历史问题库和关键词规则生成“问题概括”和“大类”
+- 导出处理后的 Excel 和本次问题明细 CSV
+
+## 本次修正版解决的问题
+
+- 固定 Python 依赖版本，降低 Streamlit Cloud 兼容性问题
+- 增加 `runtime.txt`，建议云端使用 Python 3.11
+- 增加 Excel 文件有效性检查，避免上传了无效 `.xlsx` 后直接报错
+- 增加 `safe_load_workbook()`，给出更清晰的错误提示
+- 增加 `.gitignore`，避免真实 Excel、DOCX、API Key 被上传到 GitHub
+
+## 本地运行
+
 ```bash
-cd csrc_agent_starter
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# Mac/Linux
-source .venv/bin/activate
-
 pip install -r requirements.txt
-```
-
-## 运行网页工具
-```bash
 streamlit run app.py
 ```
 
-## 直接命令行运行示例
-```bash
-python csrc_agent.py \
-  --master "境内企业境外发行证券和上市备案情况表（截至20260508)(1)(1).xlsx" \
-  --supp-doc "境外发行上市备案补充材料要求公示（2026年4月27日—2026年5月8日）.docx" \
-  --filing-xlsx "境内企业境外发行证券和上市备案情况表（首次公开发行及全流通）（截至2026年5月8日）.xlsx" \
-  --supp-date 2026-05-08 \
-  --out output.xlsx
+## Streamlit Cloud 部署
+
+1. 把本项目上传到 GitHub。
+2. Streamlit Cloud 选择该 GitHub 仓库。
+3. Main file path 填：
+
+```text
+app.py
 ```
 
-## 工作原则
-- 补充材料按“一、二、三……”大问题切割，不拆（1）（2）（3）。
-- 原问题列尽量保留监管原文。
-- 问题概括优先复用历史问题库里相似问题的标准表达。
-- 大类优先复用历史问题库分类。
-- API 只是辅助，第一版先用“关键词 + 历史相似问题匹配”跑通。
+4. 如果可以选择 Python 版本，选：
+
+```text
+3.11
+```
+
+## API Key 放哪里
+
+当前版本不强制需要 API。后续如果接 OpenAI / DeepSeek，不要写进代码。
+
+本地开发时，新建 `.streamlit/secrets.toml`：
+
+```toml
+OPENAI_API_KEY = "your_key_here"
+DEEPSEEK_API_KEY = "your_key_here"
+```
+
+Streamlit Cloud 部署时，在 App 的 Settings → Secrets 里填写同样内容。
+
+## 不要上传到 Public GitHub 的内容
+
+- 真实主表 Excel
+- 真实补充材料 DOCX
+- 处理结果 output.xlsx
+- `.streamlit/secrets.toml`
+- API Key
+

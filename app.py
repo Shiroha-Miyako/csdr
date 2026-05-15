@@ -1,25 +1,38 @@
-import os
 import tempfile
+import zipfile
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from csrc_agent import (
+    WorkbookReadError,
+    is_valid_xlsx,
     parse_supplement_doc,
     sync_filing_xlsx,
-    update_master_with_issues,
     update_completed_filings,
+    update_master_with_issues,
 )
 
 st.set_page_config(page_title="CSRC 备案表自动处理 Agent", layout="wide")
 st.title("CSRC 境外上市备案表自动处理 Agent")
-st.caption("第一版：先跑通自动解析、匹配、写表；复杂分类后续再接 API。")
+st.caption("修正版：增加 Excel 文件校验、友好报错、固定依赖，适配 Streamlit Cloud。")
+
+with st.expander("使用说明", expanded=False):
+    st.markdown(
+        """
+        1. 上传你的主表 Excel（必须是标准 `.xlsx`，不要上传 `.xls` 或网页下载失败的 HTML 文件）。  
+        2. 可选上传官网备案情况表 `.xlsx`，用于同步新增/更新企业。  
+        3. 可选上传补充材料要求 `.docx`，用于按公司拆分“一、二、三……”大问题。  
+        4. 已完成备案公司按 `公司名,日期` 每行一个填写。  
+        5. 如果 Excel 读取失败，请先用 Excel/WPS 打开后“另存为 Excel 工作簿 .xlsx”，再上传。
+        """
+    )
 
 st.sidebar.header("输入文件")
 master = st.sidebar.file_uploader("1）你的总表 xlsx", type=["xlsx"])
-supp_doc = st.sidebar.file_uploader("2）补充材料要求 docx", type=["docx"])
-filing_xlsx = st.sidebar.file_uploader("3）官网备案情况表 xlsx", type=["xlsx"])
+supp_doc = st.sidebar.file_uploader("2）补充材料要求 docx（可选）", type=["docx"])
+filing_xlsx = st.sidebar.file_uploader("3）官网备案情况表 xlsx（可选）", type=["xlsx"])
 supp_date = st.sidebar.text_input("补充材料公告日期", value="2026-05-08")
 
 st.sidebar.markdown("---")
@@ -31,67 +44,111 @@ nst_completed = st.sidebar.text_area(
 
 run = st.sidebar.button("开始处理", type="primary")
 
+
+def save_upload(uploaded_file, target_path: Path) -> Path:
+    target_path.write_bytes(uploaded_file.getvalue())
+    return target_path
+
+
+def validate_uploaded_xlsx(path: Path, label: str):
+    if not is_valid_xlsx(str(path)):
+        st.error(
+            f"{label} 不是有效的 .xlsx 文件。\n\n"
+            "请用 Excel/WPS 打开后，另存为“Excel 工作簿 (*.xlsx)”，文件名尽量改成英文后重新上传。"
+        )
+        st.stop()
+
+
+def parse_completed_items(raw_text: str):
+    items = []
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line or "," not in line:
+            continue
+        company, date = line.split(",", 1)
+        company, date = company.strip(), date.strip()
+        if company and date:
+            items.append((company, date))
+    return items
+
+
 if run:
     if not master:
         st.error("请先上传你的总表 xlsx。")
         st.stop()
 
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        master_path = td / master.name
-        master_path.write_bytes(master.getvalue())
-        current_path = master_path
+    try:
+        with tempfile.TemporaryDirectory() as td_raw:
+            td = Path(td_raw)
 
-        # Step 1: 同步官网备案情况表
-        if filing_xlsx:
-            fx = td / filing_xlsx.name
-            fx.write_bytes(filing_xlsx.getvalue())
-            synced_path = td / "01_synced_filing.xlsx"
-            changes = sync_filing_xlsx(str(current_path), str(fx), str(synced_path))
-            current_path = synced_path
-            st.success(f"备案情况表同步完成：{len(changes)} 处新增/更新")
-            if changes:
-                st.dataframe(pd.DataFrame(changes, columns=["动作", "企业名称", "列号"]))
+            master_path = td / "master.xlsx"
+            save_upload(master, master_path)
+            validate_uploaded_xlsx(master_path, "主表 Excel")
+            current_path = master_path
 
-        # Step 2: 已完成备案更新
-        completed_items = []
-        for line in nst_completed.splitlines():
-            line = line.strip()
-            if not line or "," not in line:
-                continue
-            company, date = line.split(",", 1)
-            completed_items.append((company.strip(), date.strip()))
-        if completed_items:
-            completed_path = td / "02_completed.xlsx"
-            update_completed_filings(str(current_path), completed_items, str(completed_path))
-            current_path = completed_path
-            st.success(f"已完成备案状态更新完成：{len(completed_items)} 家")
+            # Step 1: 同步官网备案情况表
+            if filing_xlsx:
+                fx = td / "filing_table.xlsx"
+                save_upload(filing_xlsx, fx)
+                validate_uploaded_xlsx(fx, "官网备案情况表 Excel")
 
-        # Step 3: 补充材料 docx 解析和写回
-        issues_df = None
-        if supp_doc:
-            sp = td / supp_doc.name
-            sp.write_bytes(supp_doc.getvalue())
-            issues = parse_supplement_doc(str(sp), str(current_path))
-            issues_df = pd.DataFrame([i.__dict__ for i in issues])
-            st.success(f"补充材料解析完成：{len(issues)} 个大问题")
-            st.dataframe(issues_df, use_container_width=True)
+                synced_path = td / "01_synced_filing.xlsx"
+                changes = sync_filing_xlsx(str(current_path), str(fx), str(synced_path))
+                current_path = synced_path
+                st.success(f"备案情况表同步完成：{len(changes)} 处新增/更新")
+                if changes:
+                    st.dataframe(pd.DataFrame(changes, columns=["动作", "企业名称", "列号"]), use_container_width=True)
 
-            final_path = td / "output_csrc_agent.xlsx"
-            update_master_with_issues(str(current_path), issues, supp_date, str(final_path))
-            current_path = final_path
+            # Step 2: 已完成备案更新
+            completed_items = parse_completed_items(nst_completed)
+            if completed_items:
+                completed_path = td / "02_completed.xlsx"
+                update_completed_filings(str(current_path), completed_items, str(completed_path))
+                current_path = completed_path
+                st.success(f"已完成备案状态更新完成：{len(completed_items)} 家")
 
-        st.markdown("### 下载结果")
-        st.download_button(
-            "下载处理后的 xlsx",
-            data=Path(current_path).read_bytes(),
-            file_name="output_csrc_agent.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        if issues_df is not None:
+            # Step 3: 补充材料 docx 解析和写回
+            issues_df = None
+            if supp_doc:
+                sp = td / "supplement.docx"
+                save_upload(supp_doc, sp)
+
+                issues = parse_supplement_doc(str(sp), str(current_path))
+                issues_df = pd.DataFrame([i.__dict__ for i in issues])
+                st.success(f"补充材料解析完成：{len(issues)} 个大问题")
+                if not issues_df.empty:
+                    st.dataframe(issues_df, use_container_width=True)
+
+                final_path = td / "output_csrc_agent.xlsx"
+                update_master_with_issues(str(current_path), issues, supp_date, str(final_path))
+                current_path = final_path
+
+            st.markdown("### 下载结果")
             st.download_button(
-                "下载本次问题明细 CSV",
-                data=issues_df.to_csv(index=False, encoding="utf-8-sig"),
-                file_name="issues_detail.csv",
-                mime="text/csv",
+                "下载处理后的 xlsx",
+                data=Path(current_path).read_bytes(),
+                file_name="output_csrc_agent.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+            if issues_df is not None:
+                st.download_button(
+                    "下载本次问题明细 CSV",
+                    data=issues_df.to_csv(index=False, encoding="utf-8-sig"),
+                    file_name="issues_detail.csv",
+                    mime="text/csv",
+                )
+
+    except WorkbookReadError as e:
+        st.error(str(e))
+        st.info("建议：把两个 Excel 都用 Excel/WPS 打开，另存为新的 .xlsx 文件，文件名改成 master.xlsx / filing_table.xlsx 后再上传。")
+        st.stop()
+    except zipfile.BadZipFile:
+        st.error("上传的 Excel 文件结构损坏，无法作为 .xlsx 读取。请重新下载或另存为新的 .xlsx 文件。")
+        st.stop()
+    except Exception as e:
+        st.error("处理失败。请先确认上传的是标准 .xlsx / .docx 文件；如果仍失败，把 Manage app 里的完整日志发给我。")
+        with st.expander("显示错误详情"):
+            st.exception(e)
+        st.stop()
+else:
+    st.info("请在左侧上传文件，然后点击“开始处理”。")
