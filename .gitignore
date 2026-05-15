@@ -1,20 +1,46 @@
+# Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Virtual environments
 .venv/
 venv/
+env/
+ENV/
 
+# Streamlit secrets - NEVER upload API keys
 .streamlit/secrets.toml
 
-data/*
-output/*
-!data/.gitkeep
-!output/.gitkeep
+# Local working folders
+data/
+output/
+uploads/
+temp/
+tmp/
 
+# Real working files - do not upload to public GitHub
 *.xlsx
 *.xls
+*.xlsm
 *.docx
 *.doc
 *.csv
 
+# Allow sanitized example files only
+!examples/
+!examples/*.xlsx
+!examples/*.docx
+!examples/*.csv
+!examples/*.md
+
+# Logs
+*.log
+
+# OS files
 .DS_Store
 Thumbs.db
+
+# IDE
+.vscode/
+.idea/
