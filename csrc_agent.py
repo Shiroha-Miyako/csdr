@@ -257,54 +257,291 @@ def find_header_row(ws, header="企业名称") -> int:
     return 3
 
 
-def find_company_row(ws, company: str, name_col: int = 2) -> Optional[int]:
-    names = []
-    rows = []
+
+# ---------------- 公司名多轮差分匹配 ----------------
+# 不建议手工维护“简称 -> 全称”表，因此这里用多轮匹配：
+# 1) 精确匹配；2) 互相包含；3) 去掉行业/后缀后的核心品牌词匹配；
+# 4) 字符覆盖率 + 最长公共子序列兜底。
+COMPANY_LEGAL_SUFFIXES = [
+    "股份有限公司", "有限责任公司", "有限公司", "集团股份", "集团", "控股", "公司"
+]
+
+# 这些词常出现在公告简称末尾或全称中，用于提取“核心品牌词”。
+# 例如：迈瑞医疗 -> 迈瑞；铂科电子 -> 铂科；绿联科技 -> 绿联。
+COMPANY_INDUSTRY_SUFFIXES = [
+    "科技", "技术", "电子", "网络", "通信", "通讯", "新能源", "新材料", "材料",
+    "医疗", "医药", "生物", "环保", "节能", "智能", "信息", "股份", "有限", "控股", "集团"
+]
+
+COMMON_LOCATION_PREFIXES = [
+    "深圳市", "深圳", "上海市", "上海", "北京市", "北京", "广州市", "广州", "南京市", "南京",
+    "成都市", "成都", "杭州", "杭州市", "苏州", "苏州市", "香港", "中国"
+]
+
+
+def normalize_company_name(name: str) -> str:
+    """公司名标准化：去空格、括号、标点和常见法律后缀。"""
+    if name is None:
+        return ""
+    s = str(name).strip()
+    s = s.replace("（", "(").replace("）", ")")
+    s = re.sub(r"\([^)]*\)", "", s)  # 删除括号内信息，如（成都）
+    s = re.sub(r"[\s\u3000·•,，.。;；:：、\-—_（）()\[\]【】]", "", s)
+    for suf in COMPANY_LEGAL_SUFFIXES:
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+    return s
+
+
+def strip_location_prefix(s: str) -> str:
+    for pre in COMMON_LOCATION_PREFIXES:
+        if s.startswith(pre) and len(s) > len(pre) + 1:
+            return s[len(pre):]
+    return s
+
+
+def core_company_candidates(name: str) -> List[str]:
+    """
+    为简称和全称生成多个候选核心词。
+    例如：
+    - 迈瑞医疗 -> 迈瑞医疗 / 迈瑞
+    - 深圳迈瑞生物医疗电子 -> 迈瑞生物医疗电子 / 迈瑞生物 / 迈瑞
+    """
+    norm = normalize_company_name(name)
+    norm2 = strip_location_prefix(norm)
+
+    cands = []
+    for x in [norm, norm2]:
+        if x and x not in cands:
+            cands.append(x)
+
+    # 对末尾行业词逐步剥离，形成核心品牌词
+    for base in list(cands):
+        cur = base
+        changed = True
+        while changed:
+            changed = False
+            for suf in COMPANY_INDUSTRY_SUFFIXES:
+                if cur.endswith(suf) and len(cur) > len(suf) + 1:
+                    cur = cur[: -len(suf)]
+                    if cur and cur not in cands:
+                        cands.append(cur)
+                    changed = True
+                    break
+
+    # 对全称中出现的行业词前缀也做一次切割：深圳迈瑞生物医疗电子 -> 深圳迈瑞 / 迈瑞
+    for base in list(cands):
+        for suf in COMPANY_INDUSTRY_SUFFIXES:
+            pos = base.find(suf)
+            if pos >= 2:
+                left = base[:pos]
+                left = strip_location_prefix(left)
+                if len(left) >= 2 and left not in cands:
+                    cands.append(left)
+
+    # 只保留长度>=2的候选，短到1个字容易误匹配
+    return [x for x in cands if len(x) >= 2]
+
+
+def lcs_len(a: str, b: str) -> int:
+    """最长公共子序列长度，用于判断“迈瑞医疗”这类非连续匹配。"""
+    if not a or not b:
+        return 0
+    # a 通常较短；为了节省内存，只保留一行 DP
+    prev = [0] * (len(b) + 1)
+    for ca in a:
+        cur = [0]
+        for j, cb in enumerate(b, start=1):
+            if ca == cb:
+                cur.append(prev[j - 1] + 1)
+            else:
+                cur.append(max(prev[j], cur[-1]))
+        prev = cur
+    return prev[-1]
+
+
+def company_match_score(query_name: str, candidate_name: str) -> Tuple[float, str]:
+    """
+    返回公司名匹配分数和原因。
+    分数设计偏保守：只有核心品牌词明确命中或字符覆盖率很高才通过。
+    """
+    q = normalize_company_name(query_name)
+    c = normalize_company_name(candidate_name)
+    if not q or not c:
+        return 0.0, "empty"
+
+    if q == c:
+        return 100.0, "exact"
+
+    if q in c or c in q:
+        # 简称直接包含在全称中，如“华健未来” in “华健未来成都科技”
+        return 96.0, "contains"
+
+    q_cores = core_company_candidates(q)
+    c_cores = core_company_candidates(c)
+
+    # 核心词包含匹配：迈瑞医疗 -> 迈瑞；铂科电子 -> 铂科
+    for qc in q_cores:
+        if len(qc) >= 2 and qc in c:
+            # 2字核心词给 92，3字以上给更高；防止过宽松
+            return (94.0 if len(qc) >= 3 else 92.0), f"query_core_in_candidate:{qc}"
+
+    for qc in q_cores:
+        for cc in c_cores:
+            if qc == cc and len(qc) >= 2:
+                return (95.0 if len(qc) >= 3 else 92.0), f"same_core:{qc}"
+            if len(qc) >= 3 and (qc in cc or cc in qc):
+                return 90.0, f"core_contains:{qc}/{cc}"
+
+    # 字符覆盖率：query 中多少非重复字符出现在 candidate 中
+    q_chars = [ch for ch in q if "\u4e00" <= ch <= "\u9fff"]
+    q_set = set(q_chars)
+    c_set = set([ch for ch in c if "\u4e00" <= ch <= "\u9fff"])
+    if q_set:
+        coverage = len(q_set & c_set) / len(q_set)
+    else:
+        coverage = 0.0
+
+    lcs = lcs_len(q, c)
+    lcs_ratio = lcs / max(1, len(q))
+
+    # 迈瑞医疗 vs 深圳迈瑞生物医疗电子：coverage=1, lcs_ratio=1，可以匹配
+    if coverage >= 0.95 and lcs_ratio >= 0.80 and len(q) >= 4:
+        return 88.0, f"char_lcs:coverage={coverage:.2f},lcs={lcs_ratio:.2f}"
+
+    # rapidfuzz 兜底，但阈值较高，避免误匹配
+    wr = fuzz.WRatio(q, c)
+    pr = fuzz.partial_ratio(q, c)
+    score = max(wr, pr)
+    if score >= 88:
+        return float(score), f"fuzzy:{score:.0f}"
+
+    return float(max(score, coverage * 80, lcs_ratio * 80)), f"low:fuzzy={score:.0f},coverage={coverage:.2f},lcs={lcs_ratio:.2f}"
+
+
+def find_company_row(ws, company: str, name_col: int = 2, min_score: float = 88.0) -> Optional[int]:
+    """兼容旧调用：只返回行号。"""
+    row, _, _, _ = find_company_row_detail(ws, company, name_col=name_col, min_score=min_score)
+    return row
+
+
+def find_company_row_detail(ws, company: str, name_col: int = 2, min_score: float = 88.0) -> Tuple[Optional[int], Optional[str], float, str]:
+    """
+    多轮公司名匹配。
+    返回：(行号, 匹配到的主表公司名, 分数, 匹配原因)
+    如果低于阈值或结果不唯一，返回 None。
+    """
+    candidates = []
     for r in range(1, ws.max_row + 1):
         v = ws.cell(r, name_col).value
         if v:
-            names.append(str(v))
-            rows.append(r)
-    # 公司简称匹配全称：用 partial_ratio
-    best = process.extractOne(company, names, scorer=fuzz.partial_ratio)
-    if best and best[1] >= 70:
-        return rows[best[2]]
-    return None
+            candidates.append((r, str(v).strip()))
 
+    if not candidates:
+        return None, None, 0.0, "no_candidates"
+
+    scored = []
+    for r, name in candidates:
+        score, reason = company_match_score(company, name)
+        scored.append((score, r, name, reason))
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+    best_score, best_row, best_name, best_reason = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else 0.0
+
+    if best_score < min_score:
+        return None, best_name, best_score, best_reason
+
+    # 如果前两名非常接近，说明可能歧义，宁可跳过，不要写错公司
+    if second_score >= min_score and best_score - second_score < 3:
+        return None, best_name, best_score, f"ambiguous:{best_reason}; second={scored[1][2]}({second_score:.1f})"
+
+    return best_row, best_name, best_score, best_reason
 
 def update_master_with_issues(master_path: str, issues: List[Issue], supp_date: str, out_path: str):
+    """
+    将补充材料问题写回主表。
+
+    重要逻辑：
+    1. docx 里出现的公司，必须先匹配到主表 Sheet1 / 备案情况总表中的公司，才写入。
+    2. 匹配到的公司：I列状态改为“补充材料”，K列写补充材料公告日期，O列写问题数量，P列起写问题原文。
+    3. 匹配不到的公司：整家公司跳过，不写 Sheet1，不追加“本次新增”，也不追加“问题类型统计”。
+       例如“再惠网络”如果主表之前完全没有披露，就不会进入统计。
+    4. 生成“公司匹配日志”sheet，方便人工检查哪些公司匹配成功/失败。
+    """
     wb = safe_load_workbook(master_path)
     ws = wb["备案情况总表"] if "备案情况总表" in wb.sheetnames else wb.active
     history_ws = wb["问题类型统计"] if "问题类型统计" in wb.sheetnames else None
     add_ws = wb["本次新增"] if "本次新增" in wb.sheetnames else wb.create_sheet("本次新增")
 
+    # 匹配日志：每次运行都重建，避免旧日志混淆
+    if "公司匹配日志" in wb.sheetnames:
+        del wb["公司匹配日志"]
+    log_ws = wb.create_sheet("公司匹配日志")
+    log_headers = ["公告公司名", "主表匹配公司名", "匹配分数", "匹配原因", "是否写入", "问题数量", "说明"]
+    for c, h in enumerate(log_headers, start=1):
+        log_ws.cell(1, c).value = h
+
     by_company: Dict[str, List[Issue]] = {}
     for it in issues:
         by_company.setdefault(it.company, []).append(it)
 
-    # 备案情况总表：K为补充材料公告日期，O问题数量，P开始问题1
-    for company, company_issues in by_company.items():
-        r = find_company_row(ws, company, name_col=2)
-        if not r:
-            print(f"[WARN] 总表未找到公司：{company}")
-            continue
-        ws.cell(r, 11).value = supp_date  # K: 备案补充材料公告日期
-        ws.cell(r, 15).value = len(company_issues)  # O: 问题数量
-        for i, it in enumerate(company_issues[:9], start=0):
-            ws.cell(r, 16+i).value = it.summary  # P-X: 问题1-问题9，填标准化问题名称；如果你要填原文，改成 it.original
+    matched_issues: List[Issue] = []
+    log_row = 2
 
-    # 本次新增：追加原问题、概括、大类
+    # 备案情况总表：I为备案状态，K为补充材料公告日期，O为问题数量，P开始问题1
+    for company, company_issues in by_company.items():
+        r, matched_name, score, reason = find_company_row_detail(ws, company, name_col=2, min_score=88.0)
+
+        if not r:
+            log_ws.cell(log_row, 1).value = company
+            log_ws.cell(log_row, 2).value = matched_name or ""
+            log_ws.cell(log_row, 3).value = round(score, 1)
+            log_ws.cell(log_row, 4).value = reason
+            log_ws.cell(log_row, 5).value = "否"
+            log_ws.cell(log_row, 6).value = len(company_issues)
+            log_ws.cell(log_row, 7).value = "主表未匹配到该公司，已跳过；不会写入Sheet1/本次新增/问题类型统计"
+            log_row += 1
+            print(f"[SKIP] 主表未匹配到公司：{company}；best={matched_name} score={score:.1f} reason={reason}")
+            continue
+
+        # 匹配成功：写入主表
+        ws.cell(r, 9).value = "补充材料"          # I: 备案状态 / 补充材料状态
+        ws.cell(r, 11).value = supp_date          # K: 备案补充材料公告日期
+        ws.cell(r, 15).value = len(company_issues)  # O: 问题数量
+
+        # P列起：问题1、问题2……写“原问题”，不是标准化概括
+        for i, it in enumerate(company_issues[:9], start=0):
+            ws.cell(r, 16 + i).value = it.original
+
+        # 如果本次问题少于9个，清空后面旧问题，避免上次残留
+        for j in range(len(company_issues), 9):
+            ws.cell(r, 16 + j).value = None
+
+        matched_issues.extend(company_issues)
+
+        log_ws.cell(log_row, 1).value = company
+        log_ws.cell(log_row, 2).value = matched_name
+        log_ws.cell(log_row, 3).value = round(score, 1)
+        log_ws.cell(log_row, 4).value = reason
+        log_ws.cell(log_row, 5).value = "是"
+        log_ws.cell(log_row, 6).value = len(company_issues)
+        log_ws.cell(log_row, 7).value = f"已写入主表第{r}行"
+        log_row += 1
+
+    # 本次新增：只追加“匹配成功公司”的问题
     start = add_ws.max_row + 1
-    for it in issues:
+    for it in matched_issues:
+        add_ws.cell(start, 1).value = it.company
         add_ws.cell(start, 2).value = it.original
         add_ws.cell(start, 3).value = it.summary
         add_ws.cell(start, 4).value = it.category
         start += 1
 
-    # 问题类型统计：追加“标准问题 + 大类”用于下次复用
+    # 问题类型统计：只追加“匹配成功公司”的标准问题 + 大类，供下次复用
     if history_ws:
         hrow = history_ws.max_row + 1
-        for it in issues:
+        for it in matched_issues:
             history_ws.cell(hrow, 1).value = it.summary
             history_ws.cell(hrow, 2).value = it.category
             history_ws.cell(hrow, 3).value = 1
