@@ -107,6 +107,53 @@ def safe_load_workbook(path: str, **kwargs):
         ) from e
 
 
+
+
+def format_date_slash(value) -> str:
+    """把日期统一格式化为 2026/5/8，不使用 2026-05-08 或前导 0。"""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return f"{value.year}/{value.month}/{value.day}"
+    text = str(value).strip()
+    if not text:
+        return ""
+    # 处理 Excel 日期字符串可能带时间：2026-05-08 00:00:00
+    text = text.split()[0]
+    patterns = [
+        r"^(\d{4})[-/\.](\d{1,2})[-/\.](\d{1,2})$",
+        r"^(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日?$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            y, mo, d = m.groups()
+            return f"{int(y)}/{int(mo)}/{int(d)}"
+    return text.replace("-", "/")
+
+
+def extract_supplement_dates_from_filename(filename: str) -> Tuple[str, str]:
+    """
+    从补充材料 Word 文件名提取：
+    境外发行上市备案补充材料要求公示（2026年4月27日—2026年5月8日）.docx
+    -> (2026/4/27, 2026/5/8)
+    第一个日期写入 J列“备案补充材料公告当周”，第二个日期写入 K列“备案补充材料公告日期”。
+    """
+    name = Path(filename).name
+    name = name.replace("（", "(").replace("）", ")")
+    name = name.replace("—", "-").replace("–", "-").replace("－", "-").replace("至", "-").replace("到", "-")
+    # 支持：2026年4月27日-2026年5月8日 / 2026年4月27日-5月8日
+    m = re.search(
+        r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*-\s*(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*日",
+        name,
+    )
+    if not m:
+        return "", ""
+    y1, m1, d1, y2, m2, d2 = m.groups()
+    y2 = y2 or y1
+    return f"{int(y1)}/{int(m1)}/{int(d1)}", f"{int(y2)}/{int(m2)}/{int(d2)}"
+
+
 @dataclass
 class Issue:
     company: str
@@ -458,7 +505,9 @@ def find_company_row_detail(ws, company: str, name_col: int = 2, min_score: floa
 
     return best_row, best_name, best_score, best_reason
 
-def update_master_with_issues(master_path: str, issues: List[Issue], supp_date: str, out_path: str):
+def update_master_with_issues(master_path: str, issues: List[Issue], supp_date: str, out_path: str, supp_week_start: str = ""):
+    supp_date = format_date_slash(supp_date)
+    supp_week_start = format_date_slash(supp_week_start) if supp_week_start else ""
     """
     将补充材料问题写回主表。
 
@@ -507,7 +556,8 @@ def update_master_with_issues(master_path: str, issues: List[Issue], supp_date: 
 
         # 匹配成功：写入主表
         ws.cell(r, 9).value = "补充材料"          # I: 备案状态 / 补充材料状态
-        ws.cell(r, 11).value = supp_date          # K: 备案补充材料公告日期
+        ws.cell(r, 10).value = supp_week_start     # J: 备案补充材料公告当周（文件名起始日期）
+        ws.cell(r, 11).value = supp_date           # K: 备案补充材料公告日期（文件名结束日期）
         ws.cell(r, 15).value = len(company_issues)  # O: 问题数量
 
         # P列起：问题1、问题2……写“原问题”，不是标准化概括
@@ -559,7 +609,7 @@ def update_completed_filings(master_path: str, completed_items: List[Tuple[str, 
         r = find_company_row(ws, company, name_col=2)
         if r:
             ws.cell(r, 9).value = "已完成备案"   # I: 备案状态
-            ws.cell(r, 12).value = completed_date # L: 已完成备案时间
+            ws.cell(r, 12).value = format_date_slash(completed_date) # L: 已完成备案时间
         else:
             print(f"[WARN] 未找到完成备案公司：{company}")
     wb.save(out_path)
@@ -613,7 +663,8 @@ def main():
     parser.add_argument("--master", required=True, help="你的总表 xlsx")
     parser.add_argument("--supp-doc", help="补充材料要求 docx")
     parser.add_argument("--filing-xlsx", help="官网备案情况表 xlsx")
-    parser.add_argument("--supp-date", default=datetime.today().strftime("%Y-%m-%d"))
+    parser.add_argument("--supp-date", default=datetime.today().strftime("%Y/%-m/%-d") if os.name != "nt" else datetime.today().strftime("%Y/%#m/%#d"))
+    parser.add_argument("--supp-week-start", default="")
     parser.add_argument("--out", default="output.xlsx")
     args = parser.parse_args()
 
@@ -629,7 +680,7 @@ def main():
         print(f"解析补充材料完成：{len(issues)} 个大问题")
         for it in issues[:10]:
             print(it.company, "|", it.summary, "|", it.category)
-        update_master_with_issues(current, issues, args.supp_date, args.out)
+        update_master_with_issues(current, issues, args.supp_date, args.out, supp_week_start=args.supp_week_start)
         print(f"已输出：{args.out}")
 
 if __name__ == "__main__":
