@@ -1,3 +1,4 @@
+import os
 import tempfile
 import zipfile
 from pathlib import Path
@@ -16,9 +17,17 @@ from csrc_agent import (
     update_master_with_issues,
 )
 
+# 把 Streamlit Cloud Secrets 写入环境变量，供 csrc_agent.py 中的 OpenAI SDK 读取
+for _key in ["OPENAI_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_MODEL", "DEEPSEEK_MODEL"]:
+    try:
+        if _key in st.secrets:
+            os.environ[_key] = str(st.secrets[_key])
+    except Exception:
+        pass
+
 st.set_page_config(page_title="CSRC 备案表自动处理 Agent", layout="wide")
 st.title("CSRC 境外上市备案表自动处理 Agent")
-st.caption("修正版：增加 Excel 文件校验、友好报错、固定依赖，适配 Streamlit Cloud。")
+st.caption("API版：规则/历史库优先，低置信度问题可调用 OpenAI 或 DeepSeek 进行分类。")
 
 with st.expander("使用说明", expanded=False):
     st.markdown(
@@ -36,6 +45,19 @@ master = st.sidebar.file_uploader("1）你的总表 xlsx", type=["xlsx"])
 supp_doc = st.sidebar.file_uploader("2）补充材料要求 docx（可选）", type=["docx"])
 filing_xlsx = st.sidebar.file_uploader("3）官网备案情况表 xlsx（可选）", type=["xlsx"])
 st.sidebar.caption("补充材料公告当周 / 公告日期会优先从 Word 文件名自动提取。")
+
+st.sidebar.markdown("---")
+st.sidebar.header("API 分类设置")
+use_llm = st.sidebar.checkbox("启用 API 智能分类（仅低置信度问题调用）", value=False)
+provider = st.sidebar.selectbox("模型服务商", ["openai", "deepseek"], index=0)
+llm_threshold = st.sidebar.slider("历史匹配分数低于多少时调用 API", min_value=50, max_value=95, value=80, step=5)
+
+if use_llm:
+    if provider == "openai" and not os.getenv("OPENAI_API_KEY"):
+        st.sidebar.warning("未检测到 OPENAI_API_KEY。请在 Streamlit Secrets 中配置。")
+    if provider == "deepseek" and not os.getenv("DEEPSEEK_API_KEY"):
+        st.sidebar.warning("未检测到 DEEPSEEK_API_KEY。请在 Streamlit Secrets 中配置。")
+
 
 st.sidebar.markdown("---")
 nst_completed = st.sidebar.text_area(
@@ -121,9 +143,9 @@ if run:
                 sp = td / "supplement.docx"
                 save_upload(supp_doc, sp)
 
-                issues = parse_supplement_doc(str(sp), str(current_path))
+                issues = parse_supplement_doc(str(sp), str(current_path), use_llm=use_llm, provider=provider, llm_threshold=llm_threshold)
                 issues_df = pd.DataFrame([i.__dict__ for i in issues])
-                st.success(f"补充材料解析完成：{len(issues)} 个大问题")
+                st.success(f"补充材料解析完成：{len(issues)} 个大问题" + (f"；API分类：{provider}" if use_llm else "；未启用API分类"))
                 if not issues_df.empty:
                     st.dataframe(issues_df, use_container_width=True)
 

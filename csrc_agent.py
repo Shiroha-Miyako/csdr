@@ -20,6 +20,11 @@ except Exception:
 from rapidfuzz import fuzz, process
 
 try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
@@ -54,6 +59,190 @@ KEYWORD_RULES = [
     (["第八条", "不得境外发行上市", "禁止境外发行上市"], "专项核查（是否存在不得境外发行上市的情形）", "法律合规"),
 ]
 
+
+
+ALLOWED_CATEGORIES = [
+    "股东情况",
+    "股权激励",
+    "股份代持",
+    "股权变更",
+    "国有股份",
+    "全流通",
+    "业务合规",
+    "法律合规",
+    "环保",
+    "数据安全",
+    "备案情况",
+    "上市方案",
+    "历史上市",
+    "未决诉讼",
+    "生产安全",
+    "待分类",
+]
+
+
+def extract_json_object(text: str) -> dict:
+    """从模型返回文本中尽量提取 JSON 对象。"""
+    text = (text or "").strip()
+    if not text:
+        return {}
+    # 去掉 ```json ... ``` 包裹
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text, flags=re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return {}
+    return {}
+
+
+def build_history_reference(issue_text: str, examples: List[Tuple[str, str, str]], limit: int = 8) -> str:
+    """为 API 分类挑选最相似的历史样例，减少模型自由发挥。"""
+    if not examples:
+        return ""
+    scored = []
+    for original, summary, category in examples:
+        score = fuzz.token_set_ratio(issue_text, original)
+        scored.append((score, original, summary, category))
+    scored.sort(reverse=True, key=lambda x: x[0])
+    lines = []
+    for score, original, summary, category in scored[:limit]:
+        lines.append(f"- 相似度{score:.0f}｜原问题：{original}\n  标准概括：{summary}\n  大类：{category}")
+    return "\n".join(lines)
+
+
+def classify_with_llm(issue_text: str, examples: List[Tuple[str, str, str]], provider: str = "openai") -> Tuple[str, str, str]:
+    """
+    真正调用 OpenAI / DeepSeek API 进行问题概括和分类。
+    返回：(summary, category, source)
+
+    需要在 Streamlit Secrets 或环境变量中配置：
+    OPENAI_API_KEY / DEEPSEEK_API_KEY
+    """
+    if OpenAI is None:
+        return "待人工确认", "待分类", "llm_error:openai_package_missing"
+
+    provider = (provider or "openai").lower().strip()
+    if provider == "deepseek":
+        api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+        if not api_key:
+            return "待人工确认", "待分类", "llm_error:missing_deepseek_key"
+        client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+        model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    else:
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            return "待人工确认", "待分类", "llm_error:missing_openai_key"
+        client = OpenAI(api_key=api_key)
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    history_ref = build_history_reference(issue_text, examples)
+    categories_text = "、".join(ALLOWED_CATEGORIES)
+
+    system_prompt = f"""
+你是一个境外发行上市备案补充材料分类助手。
+
+你的任务：根据监管问题原文，输出标准化问题概括和问题大类。
+
+必须遵守：
+1. 不要拆分（1）（2）（3）小问。一个“一、二、三”大问题只输出一个概括和一个大类。
+2. 问题概括尽量复用历史相似问题中的标准表达，不要随意创造新表达。
+3. 大类只能从以下列表选择：{categories_text}
+4. 只输出 JSON，不要输出解释、Markdown 或多余文字。
+
+JSON 格式：
+{{"summary":"标准化问题概括","category":"大类"}}
+""".strip()
+
+    user_prompt = f"""
+监管问题原文：
+{issue_text}
+
+历史相似问题参考：
+{history_ref if history_ref else "无"}
+
+请只输出 JSON。
+""".strip()
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"} if provider == "openai" else None,
+        )
+        content = response.choices[0].message.content or ""
+        data = extract_json_object(content)
+        summary = str(data.get("summary", "")).strip()
+        category = str(data.get("category", "")).strip()
+        if not summary:
+            summary = "待人工确认"
+        if category not in ALLOWED_CATEGORIES:
+            category = "待分类"
+        return summary, category, f"llm:{provider}"
+    except TypeError:
+        # 某些兼容接口不支持 response_format，重试一次
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+            )
+            content = response.choices[0].message.content or ""
+            data = extract_json_object(content)
+            summary = str(data.get("summary", "")).strip() or "待人工确认"
+            category = str(data.get("category", "")).strip()
+            if category not in ALLOWED_CATEGORIES:
+                category = "待分类"
+            return summary, category, f"llm:{provider}"
+        except Exception as e:
+            return "待人工确认", "待分类", f"llm_error:{type(e).__name__}"
+    except Exception as e:
+        return "待人工确认", "待分类", f"llm_error:{type(e).__name__}"
+
+
+def classify_issue(issue_text: str, examples: List[Tuple[str, str, str]], use_llm: bool = False, provider: str = "openai", llm_threshold: int = 80) -> Tuple[str, str, str]:
+    """
+    混合分类：先规则/历史库，再低置信度调用 API。
+    - keyword 命中：不调用 API
+    - history 分数 >= threshold：不调用 API
+    - fallback 或 history 分数低：如果 use_llm=True，则调用 API
+    """
+    summary, category, source = classify_by_rules(issue_text, examples)
+
+    if not use_llm:
+        return summary, category, source
+
+    # 关键词规则非常确定，不调用 API
+    if source == "keyword":
+        return summary, category, source
+
+    # 历史库分数足够高，不调用 API
+    if source.startswith("history:"):
+        try:
+            score = int(float(source.split(":", 1)[1]))
+        except Exception:
+            score = 0
+        if score >= llm_threshold:
+            return summary, category, source
+
+    # 其余情况调用 API
+    llm_summary, llm_category, llm_source = classify_with_llm(issue_text, examples, provider=provider)
+    if llm_summary and llm_category and not llm_source.startswith("llm_error"):
+        return llm_summary, llm_category, llm_source
+    return summary, category, source + "+" + llm_source
 
 
 class WorkbookReadError(ValueError):
@@ -282,7 +471,7 @@ def classify_by_rules(issue_text: str, examples: List[Tuple[str, str, str]]) -> 
     return "待人工确认", "待分类", "fallback"
 
 
-def parse_supplement_doc(docx_path: str, master_wb_path: str) -> List[Issue]:
+def parse_supplement_doc(docx_path: str, master_wb_path: str, use_llm: bool = False, provider: str = "openai", llm_threshold: int = 80) -> List[Issue]:
     text = read_docx_text(docx_path)
     sections = split_company_sections(text)
     wb = safe_load_workbook(master_wb_path)
@@ -291,7 +480,7 @@ def parse_supplement_doc(docx_path: str, master_wb_path: str) -> List[Issue]:
     issues: List[Issue] = []
     for company, sec in sections.items():
         for q in split_big_issues(sec):
-            summary, cat, _ = classify_by_rules(q, examples)
+            summary, cat, source = classify_issue(q, examples, use_llm=use_llm, provider=provider, llm_threshold=llm_threshold)
             issues.append(Issue(company=company, original=q, summary=summary, category=cat))
     return issues
 
@@ -666,6 +855,9 @@ def main():
     parser.add_argument("--supp-date", default=datetime.today().strftime("%Y/%-m/%-d") if os.name != "nt" else datetime.today().strftime("%Y/%#m/%#d"))
     parser.add_argument("--supp-week-start", default="")
     parser.add_argument("--out", default="output.xlsx")
+    parser.add_argument("--use-llm", action="store_true", help="低置信度问题调用 API 分类")
+    parser.add_argument("--provider", default="openai", choices=["openai", "deepseek"], help="API 服务商")
+    parser.add_argument("--llm-threshold", type=int, default=80, help="历史匹配分数低于该值时调用 API")
     args = parser.parse_args()
 
     current = args.master
@@ -676,7 +868,7 @@ def main():
         current = tmp
 
     if args.supp_doc:
-        issues = parse_supplement_doc(args.supp_doc, current)
+        issues = parse_supplement_doc(args.supp_doc, current, use_llm=args.use_llm, provider=args.provider, llm_threshold=args.llm_threshold)
         print(f"解析补充材料完成：{len(issues)} 个大问题")
         for it in issues[:10]:
             print(it.company, "|", it.summary, "|", it.category)
